@@ -2,8 +2,8 @@ import { useEffect, useState } from 'react'
 import { Activity, ArrowRight, Check, CircleAlert, Database, RefreshCw, ShieldCheck, Sparkles, X } from 'lucide-react'
 
 type Batch = { id:string; name:string; status:string }
-type Summary = { batch:Batch; total_records:number; matched_records:number; exceptions:number; open_exceptions:number; resolved_exceptions:number; match_rate:number; resolution_rate:number; accuracy:number|null }
-type Evidence = { payment_id:string; payment_amount:string; settlement_amount:string|null; bank_amount:string|null }
+type Summary = { batch:Batch; total_records:number; matched_records:number; exceptions:number; open_exceptions:number; resolved_exceptions:number; match_rate:number; resolution_rate:number; accuracy:number|null; total_value:string; amount_at_risk:string; reconciled_amount:string; high_risk_amount:string }
+type Evidence = { payment_id:string; payment_amount:string; settlement_amount:string|null; bank_amount:string|null; fields?:{field:string;status:string;expected:string|null;actual:string|null}[]; amount_difference?:string; date_difference?:number|null; rule?:string; rule_explanation?:string; deterministic_confidence?:string; confidence_factors?:{name:string;points:string;status:string}[]; policy_decision?:string; policy_reason?:string; ai_analysis?:{classification:string;confidence:number;likely_cause:string;recommended_action:string;explanation:string;suggested_resolution:string} }
 type ExceptionItem = { id:string; exception_type:string; severity:string; ai_reason:string; ai_confidence:string; evidence:Evidence; status:string; created_at:string }
 
 async function json<T>(path:string, init?:RequestInit):Promise<T> {
@@ -32,6 +32,8 @@ export function App() {
     setSummary(nextSummary); setExceptions(nextExceptions)
   }
 
+  // Initial data loading is intentionally stateful; it synchronizes the UI with the API.
+  // eslint-disable-next-line react-hooks/exhaustive-deps, react-hooks/set-state-in-effect
   useEffect(() => { load().catch(e => setError(e.message)) }, [])
 
   async function generate() {
@@ -48,6 +50,7 @@ export function App() {
   }
 
   const open = exceptions.filter(item => item.status === 'PENDING_REVIEW')
+  const money = (value:string) => `₹${Number(value).toLocaleString('en-IN', {maximumFractionDigits: 2})}`
   return <main>
     <header>
       <a className="brand" href="#"><span className="brand-mark">FC</span><span>FINANCE<br/>CONTROL</span></a>
@@ -70,10 +73,10 @@ export function App() {
       </section>
 
       <section className="metrics">
-        <Metric label="RECORDS CONTROLLED" value={summary.total_records.toLocaleString()} note="PAYMENT EVENTS" icon={<Database/>}/>
-        <Metric label="DETERMINISTIC MATCH" value={`${summary.match_rate}%`} note={`${summary.matched_records} CLEARED`} icon={<ShieldCheck/>}/>
-        <Metric label="OPEN EXCEPTIONS" value={String(summary.open_exceptions).padStart(2,'0')} note={`${summary.resolved_exceptions} RESOLVED`} alert icon={<CircleAlert/>}/>
-        <Metric label="BENCHMARK ACCURACY" value={summary.accuracy == null ? 'N/A' : `${summary.accuracy}%`} note={`${summary.resolution_rate}% CONTROLLED`} icon={<Activity/>}/>
+         <Metric label="AMOUNT AT RISK" value={money(summary.amount_at_risk)} note={`${summary.open_exceptions} OPEN EXCEPTIONS`} alert icon={<CircleAlert/>}/>
+         <Metric label="RECONCILED VALUE" value={money(summary.reconciled_amount)} note={`${summary.match_rate}% MATCH RATE`} icon={<ShieldCheck/>}/>
+         <Metric label="RECORDS CONTROLLED" value={summary.total_records.toLocaleString()} note={`${money(summary.total_value)} TOTAL VALUE`} icon={<Database/>}/>
+         <Metric label="HIGH-RISK VALUE" value={money(summary.high_risk_amount)} note={`${summary.resolved_exceptions} RESOLVED`} alert icon={<Activity/>}/>
       </section>
 
       <section className="workspace">
@@ -82,7 +85,12 @@ export function App() {
           {open.length === 0 ? <div className="cleared"><ShieldCheck/><h3>Queue cleared</h3><p>All exceptions have a recorded control decision.</p></div> : open.slice(0,8).map(item=><article className="exception" key={item.id}>
             <div className="exception-top"><div><span className={`severity ${item.severity.toLowerCase()}`}>{item.severity}</span><strong>{item.exception_type.replaceAll('_',' ')}</strong></div><code>{item.id}</code></div>
             <div className="evidence"><div><span>PAYMENT</span><b>₹{item.evidence.payment_amount}</b></div><ArrowRight/><div><span>SETTLEMENT</span><b>{item.evidence.settlement_amount ? `₹${item.evidence.settlement_amount}`:'MISSING'}</b></div><ArrowRight/><div><span>BANK</span><b>{item.evidence.bank_amount ? `₹${item.evidence.bank_amount}`:'MISSING'}</b></div></div>
-            <div className="ai"><Sparkles size={15}/><p><span>STRUCTURED ANALYSIS · {(Number(item.ai_confidence)*100).toFixed(0)}% CONFIDENCE</span>{item.ai_reason}</p></div>
+             <div className="ai"><Sparkles size={15}/><p><span>STRUCTURED ANALYSIS · {(Number(item.ai_confidence)*100).toFixed(0)}% CONFIDENCE</span>{item.ai_reason}</p></div>
+             <details className="investigation"><summary>Why did this fail?</summary><div className="investigation-grid">
+               {(item.evidence.fields || []).map(field=><div key={field.field}><span>{field.status === 'MATCH' ? '✓' : '✗'} {field.field}</span><b>{field.actual || 'MISSING'}</b></div>)}
+               <div><span>RULE</span><b>{item.evidence.rule || 'Not available'}</b></div><div><span>AMOUNT DELTA</span><b>{item.evidence.amount_difference ? money(item.evidence.amount_difference) : 'N/A'}</b></div>
+               <div><span>POLICY</span><b>{item.evidence.policy_decision || 'HUMAN_REVIEW'}</b></div><div><span>AI CONCLUSION</span><b>{item.evidence.ai_analysis?.likely_cause || item.ai_reason}</b></div>
+             </div></details>
             <div className="actions"><button onClick={()=>review(item.id,'REJECT')}><X size={15}/> Confirm exception</button><button className="approve" onClick={()=>review(item.id,'APPROVE')}><Check size={15}/> Approve match</button></div>
           </article>)}
         </div>
