@@ -104,6 +104,7 @@ def generate_demo(request: DemoRequest, db: Session = Depends(get_db)):
     rng = random.Random(request.seed)
     batch = Batch(id=id_for("BAT"), name=f"Demo batch · {request.records:,} records", status="PROCESSING")
     db.add(batch)
+    db.flush()
     start = date(2026, 8, 1)
     for index in range(request.records):
         suffix = batch.id[-6:].upper()
