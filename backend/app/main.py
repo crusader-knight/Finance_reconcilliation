@@ -15,6 +15,9 @@ from .models import (AuditLog, BankTransaction, Batch, ExceptionRecord, GroundTr
                      Order, Payment, ReconciliationResult, Rejection, Settlement, id_for,
                      now_utc)
 from .schemas import BatchResponse, DemoRequest, ReviewRequest, UploadResponse
+from .analyst import ExceptionAnalyst
+from .policy import Policy, decide
+from .reconciliation import ReconciliationPolicy, compare, deterministic_score
 
 Base.metadata.create_all(engine)
 app = FastAPI(title="AI Finance Controller", version="0.1.0")
@@ -33,8 +36,12 @@ def cents(value: Decimal) -> Decimal:
 
 def reconcile(db: Session, batch_id: str) -> None:
     payments = db.scalars(select(Payment).where(Payment.batch_id == batch_id)).all()
-    settlements = {item.transaction_id: item for item in db.scalars(select(Settlement).where(Settlement.batch_id == batch_id)).all()}
+    settlement_rows = db.scalars(select(Settlement).where(Settlement.batch_id == batch_id)).all()
+    settlements = {item.transaction_id: item for item in settlement_rows}
     banks = db.scalars(select(BankTransaction).where(BankTransaction.batch_id == batch_id)).all()
+    analyst = ExceptionAnalyst()
+    matching_policy = ReconciliationPolicy()
+    decision_policy = Policy()
     used_banks: set[str] = set()
     for payment in payments:
         settlement = settlements.get(payment.id)
@@ -43,40 +50,45 @@ def reconcile(db: Session, batch_id: str) -> None:
             bank = next((b for b in banks if b.id not in used_banks and b.amount == settlement.net_amount
                          and b.merchant_id == payment.merchant_id
                          and abs((b.transaction_date - settlement.settlement_date).days) <= 1), None)
-        confidence = Decimal("0")
-        status = "UNMATCHED"
-        match_type = "NO_MATCH"
-        reason = "No settlement or bank transaction was found"
-        if settlement and bank:
+        duplicate_signals = []
+        if sum(item.id == payment.id for item in payments) > 1:
+            duplicate_signals.append("duplicate_payment_id")
+        if settlement and sum(item.transaction_id == settlement.transaction_id for item in settlement_rows) > 1:
+            duplicate_signals.append("duplicate_settlement_transaction_id")
+        if bank and sum(item.reference == bank.reference for item in banks) > 1:
+            duplicate_signals.append("duplicate_bank_reference")
+        if bank:
             used_banks.add(bank.id)
-            amount_delta = abs(payment.amount - settlement.net_amount)
-            date_delta = abs((bank.transaction_date - payment.payment_date).days)
-            if settlement.gross_amount == payment.amount and amount_delta == 0 and bank.amount == settlement.net_amount and date_delta <= 2:
-                confidence, status, match_type = Decimal("0.99"), "MATCHED", "EXACT_CHAIN"
-                reason = "Payment, settlement and bank amount agree"
-            elif settlement.gross_amount == payment.amount and bank.amount == settlement.net_amount and date_delta <= 2:
-                confidence, status, match_type = Decimal("0.96"), "MATCHED", "FEE_ADJUSTED"
-                reason = "Net settlement agrees after gateway fee and tax"
-            elif bank.merchant_id == payment.merchant_id and date_delta <= 2:
-                confidence, status, match_type = Decimal("0.82"), "PENDING_REVIEW", "RULE_BASED"
-                reason = "Merchant and date align, but financial amounts need review"
-            else:
-                confidence, match_type = Decimal("0.42"), "AI_ASSISTED"
-                reason = "Conflicting evidence requires human verification"
+        match_type, reason, amount_delta, evidence = compare(payment, settlement, bank, matching_policy, duplicate_signals)
+        confidence, factors = deterministic_score(evidence)
+        matched = match_type in {"EXACT_CHAIN", "FEE_ADJUSTED"} and not duplicate_signals
+        policy_decision, policy_reason = decide(confidence, payment.amount, bool(duplicate_signals), matched, decision_policy)
+        status = "MATCHED" if policy_decision == "AUTO_RESOLVE" else "PENDING_REVIEW"
+        if match_type == "NO_MATCH":
+            status = "UNMATCHED"
+        evidence_dict = {
+            "payment_id": payment.id, "payment_amount": str(payment.amount),
+            "settlement_amount": str(settlement.net_amount) if settlement else None,
+            "bank_amount": str(bank.amount) if bank else None,
+            **evidence.as_dict(), "deterministic_confidence": str(confidence),
+            "confidence_factors": factors, "policy_decision": policy_decision,
+            "policy_reason": policy_reason,
+        }
+        if status != "MATCHED":
+            analysis = analyst.analyze(evidence_dict)
+            evidence_dict["ai_analysis"] = analysis.model_dump(mode="json")
+            reason = analysis.explanation
         result = ReconciliationResult(id=id_for("REC"), batch_id=batch_id, payment_id=payment.id,
                                       bank_transaction_id=bank.id if bank else None, match_type=match_type,
                                       confidence=confidence, status=status, reason=reason)
         db.add(result)
         if status != "MATCHED":
-            exception_type = "MISSING_TRANSACTION" if not settlement or not bank else "AMOUNT_MISMATCH"
+            exception_type = evidence_dict.get("ai_analysis", {}).get("classification", "unknown")
             db.flush()
             db.add(ExceptionRecord(id=id_for("EXC"), batch_id=batch_id, reconciliation_id=result.id,
-                                   exception_type=exception_type, severity="HIGH" if confidence < Decimal("0.75") else "MEDIUM",
-                                   ai_reason=reason, ai_confidence=confidence, evidence={
-                                       "payment_id": payment.id, "payment_amount": str(payment.amount),
-                                       "settlement_amount": str(settlement.net_amount) if settlement else None,
-                                       "bank_amount": str(bank.amount) if bank else None,
-                                   }))
+                                   exception_type=exception_type, severity="HIGH" if policy_decision == "HIGH_RISK" else "MEDIUM",
+                                   ai_reason=evidence_dict.get("ai_analysis", {}).get("explanation", reason),
+                                   ai_confidence=Decimal(str(evidence_dict.get("ai_analysis", {}).get("confidence", confidence))), evidence=evidence_dict))
         audit(db, batch_id, "payment", payment.id, "RECONCILED", reason, {"status": status, "confidence": str(confidence)})
     db.query(Batch).filter(Batch.id == batch_id).update({"status": "COMPLETED"})
     db.commit()
@@ -131,16 +143,31 @@ def summary(batch_id: str, db: Session = Depends(get_db)):
     predictions = {item.payment_id: item.status == "MATCHED" for item in db.scalars(select(ReconciliationResult).where(ReconciliationResult.batch_id == batch_id)).all()}
     truth = db.scalars(select(GroundTruth).where(GroundTruth.batch_id == batch_id)).all()
     correct = sum(predictions.get(item.payment_id) == item.should_match for item in truth)
+    amounts = db.scalars(select(Payment).where(Payment.batch_id == batch_id)).all()
+    open_rows = db.scalars(select(ExceptionRecord).where(ExceptionRecord.batch_id == batch_id, ExceptionRecord.status == "PENDING_REVIEW")).all()
+    at_risk = sum((Decimal(row.evidence.get("payment_amount", "0")) for row in open_rows), Decimal("0"))
+    total_value = sum((row.amount for row in amounts), Decimal("0"))
     return {"batch": BatchResponse.model_validate(batch, from_attributes=True), "total_records": total, "matched_records": matched,
             "exceptions": total - matched, "open_exceptions": open_exceptions, "resolved_exceptions": resolved,
             "match_rate": round(matched / total * 100, 1) if total else 0,
             "resolution_rate": round((matched + resolved) / total * 100, 1) if total else 0,
-            "accuracy": round(correct / len(truth) * 100, 1) if truth else None}
+            "accuracy": round(correct / len(truth) * 100, 1) if truth else None,
+            "total_value": str(total_value), "amount_at_risk": str(at_risk),
+            "reconciled_amount": str(total_value - at_risk), "high_risk_amount": str(sum((Decimal(row.evidence.get("payment_amount", "0")) for row in open_rows if row.severity == "HIGH"), Decimal("0")))}
 
 
 @app.get("/api/v1/batches/{batch_id}/exceptions")
 def exceptions(batch_id: str, db: Session = Depends(get_db)):
     return db.scalars(select(ExceptionRecord).where(ExceptionRecord.batch_id == batch_id).order_by(ExceptionRecord.created_at.desc())).all()
+
+
+@app.get("/api/v1/exceptions/{exception_id}")
+def exception_detail(exception_id: str, db: Session = Depends(get_db)):
+    exception = db.get(ExceptionRecord, exception_id)
+    if not exception:
+        raise HTTPException(404, "Exception not found")
+    result = db.get(ReconciliationResult, exception.reconciliation_id)
+    return {"exception": exception, "reconciliation": result, "evidence": exception.evidence}
 
 
 @app.post("/api/v1/exceptions/{exception_id}/review")
@@ -173,8 +200,14 @@ async def upload(batch_id: str, source_type: str, file: UploadFile = File(...), 
             if missing:
                 raise ValueError(f"Missing columns: {', '.join(sorted(missing))}")
             if source_type == "payments":
+                if db.get(Payment, row["transaction_id"]):
+                    raise ValueError("Duplicate payment transaction_id already ingested")
                 db.add(Payment(id=row["transaction_id"], batch_id=batch_id, order_id=row["order_id"], merchant_id=row["merchant_id"], payment_mode=row.get("payment_mode", "UNKNOWN"), amount=Decimal(row["amount"]), payment_date=date.fromisoformat(row["payment_date"])))
             else:
+                if db.get(BankTransaction, row["bank_txn_id"]):
+                    raise ValueError("Duplicate bank transaction already ingested")
+                if db.scalar(select(BankTransaction).where(BankTransaction.batch_id == batch_id, BankTransaction.reference == row["reference"], BankTransaction.amount == Decimal(row["amount"]), BankTransaction.transaction_date == date.fromisoformat(row["transaction_date"]))):
+                    raise ValueError("Duplicate bank reference, amount and date already ingested")
                 db.add(BankTransaction(id=row["bank_txn_id"], batch_id=batch_id, merchant_id=row["merchant_id"], amount=Decimal(row["amount"]), transaction_date=date.fromisoformat(row["transaction_date"]), reference=row["reference"], narration=row.get("narration"), bank_name=row.get("bank_name")))
             accepted += 1
         except (ValueError, KeyError) as error:
